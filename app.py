@@ -14,7 +14,10 @@ Run with:  streamlit run app.py
 Requires:  streamlit, pandas, smartystreets_python_sdk
 """
 
+import json
+
 import pandas as pd
+import requests
 import streamlit as st
 
 # The Smarty SDK is optional at import time so the rest of the app still
@@ -61,6 +64,23 @@ STREET_COLUMN = "Mailing Address"
 CITY_COLUMN = "Mailing City"
 STATE_COLUMN = "Mailing State"
 ZIP_COLUMN = "Mailing Zip Code"
+
+XAI_BASE_URL = "https://api.x.ai/v1/chat/completions"
+XAI_MODEL = "grok-4.5"
+SCORING_BATCH_SIZE = 15  # leads per API call - keeps prompts small and cheap
+
+# The default yardstick. Editable in the UI so it can be tuned without a
+# code change.
+DEFAULT_SCORING_CRITERIA = """We sell voluntary worksite benefits to employers,
+enrolling their employees on site. A strong lead is a business with enough
+employees to make an on-site enrollment worth the trip, in an industry with a
+stable W-2 workforce rather than heavy seasonal or contract labor, and with a
+named contact senior enough to approve a benefits decision (owner, president,
+CEO, HR director, office manager at a small company).
+
+Weaker leads: very small headcount, franchises or branches that cannot decide
+locally, industries with mostly part-time or transient staff, and contacts with
+no decision-making authority."""
 
 DEFAULT_MIN_EMPLOYEES = 5
 MAX_PREVIEW_ROWS = 1000
@@ -289,15 +309,100 @@ def verify_addresses(df: pd.DataFrame, auth_id: str, auth_token: str, progress=N
 # Step 3 stub - Grok (xAI) scoring
 # ---------------------------------------------------------------------------
 
-def score_leads(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    NOT IMPLEMENTED YET.
+def lead_to_summary(row) -> str:
+    """Condense one row into the few fields Grok needs to judge fit."""
+    name = row.get("Company Name", "")
+    size = row.get(SIZE_COLUMN, "unknown size")
+    industry = row.get("Primary SIC Code Description", "unknown industry")
+    title = row.get("Executive Title", "no contact title")
+    city = row.get("Mailing City", "")
+    state = row.get("Mailing State", "")
 
-    Will send company size, SIC description, and executive title to the xAI
-    API and append a fit score plus a short rationale column. Use XAI_API_KEY
-    above and cache results by Infogroup ID so re-runs don't re-bill.
+    return f"{name} | {size} employees | {industry} | contact: {title} | {city}, {state}"
+
+
+def call_xai(prompt: str, api_key: str) -> str:
+    """POST one prompt to the xAI chat completions endpoint, return the text."""
+    response = requests.post(
+        XAI_BASE_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": XAI_MODEL,
+            "temperature": 0,  # scoring should be repeatable
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You score B2B sales leads. Reply with a JSON array only - "
+                        "no prose, no markdown fences. Each element must be "
+                        '{"id": <number>, "score": <1-10>, "reason": "<12 words max>"}.'
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
+
+
+def parse_scores(raw: str) -> dict:
+    """Turn the model's JSON reply into {id: (score, reason)}."""
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        # Strip a markdown fence if one slipped through.
+        cleaned = cleaned.split("```")[1]
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
+
+    parsed = {}
+    for item in json.loads(cleaned):
+        try:
+            parsed[int(item["id"])] = (int(item["score"]), str(item.get("reason", "")))
+        except (KeyError, ValueError, TypeError):
+            continue  # skip malformed entries rather than failing the batch
+    return parsed
+
+
+def score_leads(df: pd.DataFrame, api_key: str, criteria: str, progress=None) -> pd.DataFrame:
     """
-    return df
+    Score each lead 1-10 for fit and append the score plus a short reason.
+
+    Sends SCORING_BATCH_SIZE leads per call to keep token use down. Any batch
+    that fails leaves its rows unscored rather than killing the whole run.
+    Returns a new DataFrame.
+    """
+    scores = {index: (None, "") for index in df.index}
+    indexes = list(df.index)
+
+    for batch_start in range(0, len(indexes), SCORING_BATCH_SIZE):
+        chunk = indexes[batch_start:batch_start + SCORING_BATCH_SIZE]
+
+        lines = [f"{index}: {lead_to_summary(df.loc[index])}" for index in chunk]
+        prompt = (
+            f"Scoring criteria:\n{criteria}\n\n"
+            f"Score each lead below from 1 (poor fit) to 10 (excellent fit). "
+            f"Use the id number shown at the start of each line.\n\n"
+            + "\n".join(lines)
+        )
+
+        try:
+            scores.update(parse_scores(call_xai(prompt, api_key)))
+        except Exception:
+            pass  # leave this batch unscored; the UI reports the gap
+
+        if progress is not None:
+            progress.progress(min((batch_start + SCORING_BATCH_SIZE) / len(indexes), 1.0))
+
+    scored = pd.DataFrame(
+        [{"Fit Score": scores[i][0], "Score Reason": scores[i][1]} for i in df.index],
+        index=df.index,
+    )
+    return df.join(scored)
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +514,59 @@ def render_smarty_section(working_df: pd.DataFrame, file_key: str) -> pd.DataFra
     return verified_df
 
 
+def render_scoring_section(working_df: pd.DataFrame, file_key: str) -> pd.DataFrame:
+    """
+    Draw the Grok scoring controls. Like verification, this runs only on
+    button press so reruns don't re-bill.
+    """
+    st.subheader("Score leads")
+
+    if not XAI_API_KEY:
+        st.info("No xAI key found. Add XAI_API_KEY in the app's Secrets settings.")
+        return working_df
+
+    criteria = st.text_area(
+        "What makes a good lead?",
+        value=DEFAULT_SCORING_CRITERIA,
+        height=180,
+        help="Edit this to change how leads are judged. Changes apply on the next run.",
+    )
+
+    cache_key = f"scored::{file_key}::{len(working_df)}"
+    call_count = -(-len(working_df) // SCORING_BATCH_SIZE)  # ceiling division
+
+    st.caption(f"{len(working_df):,} leads, {call_count} API calls at {SCORING_BATCH_SIZE} per call.")
+
+    if st.button(f"Score {len(working_df):,} leads", type="primary"):
+        progress = st.progress(0.0)
+        try:
+            st.session_state[cache_key] = score_leads(
+                working_df, XAI_API_KEY, criteria, progress
+            )
+        except Exception as err:
+            st.error(f"Scoring failed: {err}")
+            return working_df
+        finally:
+            progress.empty()
+
+    if cache_key not in st.session_state:
+        return working_df
+
+    scored_df = st.session_state[cache_key]
+    unscored = int(scored_df["Fit Score"].isna().sum())
+
+    if unscored:
+        st.warning(f"{unscored:,} leads came back unscored. Run again to retry those batches.")
+
+    minimum_score = st.slider("Minimum fit score", 1, 10, 1)
+    if minimum_score > 1:
+        scored_df = scored_df[scored_df["Fit Score"].fillna(0) >= minimum_score].copy()
+        st.caption(f"{len(scored_df):,} leads at score {minimum_score} or above.")
+
+    # Best prospects first.
+    return scored_df.sort_values("Fit Score", ascending=False, na_position="last")
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
 
@@ -486,8 +644,8 @@ def main() -> None:
     # --- Smarty verification ---
     working_df = render_smarty_section(working_df, uploaded_file.name)
 
-    # --- Step 3 will slot in here ---
-    # working_df = score_leads(working_df)
+    # --- Grok scoring ---
+    working_df = render_scoring_section(working_df, uploaded_file.name)
 
     st.subheader("Leads")
     st.dataframe(working_df.head(MAX_PREVIEW_ROWS), use_container_width=True)
