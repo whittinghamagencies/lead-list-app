@@ -183,10 +183,24 @@ def blank_result() -> dict:
         "Verified State": "",
         "Verified ZIP+4": "",
         "County": "",
+        "Property Type": "",
+        "Record Type": "",
+        "Vacant": "",
         "DPV Match Code": "",
         "Latitude": "",
         "Longitude": "",
     }
+
+
+# Smarty's single-letter record types, spelled out.
+RECORD_TYPES = {
+    "F": "Firm",
+    "G": "General Delivery",
+    "H": "Highrise",
+    "P": "PO Box",
+    "R": "Rural Route",
+    "S": "Street",
+}
 
 
 def candidate_to_result(candidate, original_street: str) -> dict:
@@ -212,6 +226,10 @@ def candidate_to_result(candidate, original_street: str) -> dict:
         "Verified State": components.state_abbreviation or "",
         "Verified ZIP+4": zip_plus_four,
         "County": metadata.county_name or "",
+        # rdi comes back as "Residential" or "Commercial".
+        "Property Type": metadata.rdi or "Unknown",
+        "Record Type": RECORD_TYPES.get(metadata.record_type, metadata.record_type or ""),
+        "Vacant": "Yes" if analysis.vacant == "Y" else "No",
         "DPV Match Code": analysis.dpv_match_code or "",
         "Latitude": metadata.latitude or "",
         "Longitude": metadata.longitude or "",
@@ -343,13 +361,50 @@ def render_smarty_section(working_df: pd.DataFrame, file_key: str) -> pd.DataFra
     verified_df = st.session_state[cache_key]
 
     counts = verified_df["Address Status"].value_counts()
-    stat_a, stat_b, stat_c = st.columns(3)
+    property_counts = verified_df["Property Type"].value_counts()
+
+    stat_a, stat_b, stat_c, stat_d = st.columns(4)
     stat_a.metric("Verified as sent", f"{counts.get('Verified', 0):,}")
     stat_b.metric("Corrected", f"{counts.get('Corrected', 0):,}")
     stat_c.metric("Not found", f"{counts.get('Not found', 0):,}")
+    stat_d.metric("Commercial", f"{property_counts.get('Commercial', 0):,}")
 
-    if st.checkbox("Show only mailable addresses", value=False):
+    # Post-verification filters. Each one narrows toward addresses a setter
+    # could actually show up at.
+    filter_a, filter_b, filter_c = st.columns(3)
+    mailable_only = filter_a.checkbox("Mailable only", value=False,
+                                      help="Drops addresses Smarty couldn't match.")
+    commercial_only = filter_b.checkbox("Commercial only", value=False,
+                                        help="Drops addresses flagged residential.")
+    drop_po_boxes = filter_c.checkbox("No PO boxes", value=False,
+                                      help="Drops PO box and general delivery records.")
+
+    if mailable_only:
         verified_df = verified_df[verified_df["Address Status"] != "Not found"].copy()
+    if commercial_only:
+        verified_df = verified_df[verified_df["Property Type"] == "Commercial"].copy()
+    if drop_po_boxes:
+        verified_df = verified_df[
+            ~verified_df["Record Type"].isin(["PO Box", "General Delivery"])
+        ].copy()
+
+    if mailable_only or commercial_only or drop_po_boxes:
+        st.caption(f"{len(verified_df):,} leads match the address filters.")
+
+    # A dedicated export with residential addresses stripped out. This keeps
+    # anything Smarty couldn't classify - only rows explicitly flagged
+    # Residential are dropped, so unmatched addresses aren't silently lost.
+    non_residential = verified_df[verified_df["Property Type"] != "Residential"].copy()
+    residential_count = len(verified_df) - len(non_residential)
+
+    st.download_button(
+        f"Download non-residential list ({len(non_residential):,} leads)",
+        data=non_residential.to_csv(index=False).encode("utf-8"),
+        file_name=f"non_residential_{file_key}",
+        mime="text/csv",
+        type="primary",
+    )
+    st.caption(f"Excludes {residential_count:,} addresses flagged residential.")
 
     return verified_df
 
