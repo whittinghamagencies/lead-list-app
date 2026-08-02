@@ -87,6 +87,11 @@ no decision-making authority."""
 # costs far more than scoring. Capped by default.
 DEFAULT_CONTACT_CHECK_LIMIT = 25
 
+# Apollo bulk enrichment: ten people per call, one credit per record matched.
+APOLLO_BULK_URL = "https://api.apollo.io/api/v1/people/bulk_match"
+APOLLO_BATCH_SIZE = 10
+DEFAULT_APOLLO_LIMIT = 50
+
 DEFAULT_MIN_EMPLOYEES = 5
 MAX_PREVIEW_ROWS = 1000
 SMARTY_BATCH_SIZE = 100  # Smarty's per-request maximum
@@ -107,6 +112,7 @@ def get_secret(name: str, default: str = "") -> str:
 SMARTY_AUTH_ID = get_secret("SMARTY_AUTH_ID")
 SMARTY_AUTH_TOKEN = get_secret("SMARTY_AUTH_TOKEN")
 XAI_API_KEY = get_secret("XAI_API_KEY")
+APOLLO_API_KEY = get_secret("APOLLO_API_KEY")
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +531,146 @@ def verify_contacts(df: pd.DataFrame, api_key: str, limit: int, progress=None) -
 
 
 # ---------------------------------------------------------------------------
+# Apollo - check our executive names against Apollo's records
+# ---------------------------------------------------------------------------
+
+# Words that don't help decide whether two company names are the same business.
+COMPANY_NOISE = {
+    "inc", "llc", "ltd", "co", "corp", "corporation", "company", "the",
+    "svc", "svcs", "service", "services", "group", "holdings", "and", "of",
+}
+
+
+def normalize_company(name: str) -> set:
+    """Reduce a company name to its meaningful words for comparison."""
+    if not isinstance(name, str):
+        return set()
+
+    cleaned = "".join(char if char.isalnum() else " " for char in name.lower())
+    return {word for word in cleaned.split() if word and word not in COMPANY_NOISE}
+
+
+def same_company(ours: str, theirs: str) -> bool:
+    """
+    Decide whether two company names refer to the same business.
+
+    Compares meaningful words rather than exact strings, so "Aska USA" and
+    "Aska USA Inc." match, but "Apollo Aviation" and "Apollo Roofing" don't.
+    """
+    ours_words, theirs_words = normalize_company(ours), normalize_company(theirs)
+    if not ours_words or not theirs_words:
+        return False
+
+    overlap = len(ours_words & theirs_words)
+    return overlap / min(len(ours_words), len(theirs_words)) >= 0.6
+
+
+def blank_apollo() -> dict:
+    """The shape of one Apollo result, all empty."""
+    return {
+        "Apollo Status": "",
+        "Apollo Current Employer": "",
+        "Apollo Current Title": "",
+        "Apollo LinkedIn": "",
+    }
+
+
+def apollo_status(row, person: dict) -> dict:
+    """
+    Compare one Apollo person record against what our lead list claims.
+
+    "Still listed"  - Apollo has them at the same company
+    "Moved on"      - Apollo has them somewhere else now
+    "Title changed" - same company, different title from our record
+    "Not in Apollo" - no record found for that name at that company
+    """
+    if not person:
+        return {**blank_apollo(), "Apollo Status": "Not in Apollo"}
+
+    organization = person.get("organization") or {}
+    their_company = organization.get("name") or ""
+    their_title = person.get("title") or ""
+    our_company = row.get("Company Name", "")
+    our_title = str(row.get("Executive Title", "") or "").strip().lower()
+
+    if not their_company:
+        status = "Not in Apollo"
+    elif same_company(our_company, their_company):
+        # Same employer. Flag a title change only when both titles are known.
+        if our_title and their_title and our_title not in their_title.lower():
+            status = "Title changed"
+        else:
+            status = "Still listed"
+    else:
+        status = "Moved on"
+
+    return {
+        "Apollo Status": status,
+        "Apollo Current Employer": their_company,
+        "Apollo Current Title": their_title,
+        "Apollo LinkedIn": person.get("linkedin_url") or "",
+    }
+
+
+def apollo_bulk_match(df: pd.DataFrame, api_key: str, limit: int, progress=None) -> pd.DataFrame:
+    """
+    Send executive names to Apollo in batches of ten and append what Apollo
+    currently has on file for each one.
+
+    Only rows with a first and last name are sent, since Apollo can't match
+    on a company name alone and a blank lookup still costs a call.
+    """
+    results = {index: blank_apollo() for index in df.index}
+
+    targets = [
+        index for index in list(df.index)[:limit]
+        if str(df.at[index, "Executive First Name"] or "").strip() not in ("", "None", "nan")
+        and str(df.at[index, "Executive Last Name"] or "").strip() not in ("", "None", "nan")
+    ]
+
+    for batch_start in range(0, len(targets), APOLLO_BATCH_SIZE):
+        chunk = targets[batch_start:batch_start + APOLLO_BATCH_SIZE]
+
+        details = [
+            {
+                "first_name": str(df.at[index, "Executive First Name"]),
+                "last_name": str(df.at[index, "Executive Last Name"]),
+                "organization_name": str(df.at[index, "Company Name"] or ""),
+            }
+            for index in chunk
+        ]
+
+        try:
+            response = requests.post(
+                APOLLO_BULK_URL,
+                headers={
+                    "x-api-key": api_key,          # header auth only
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-cache",
+                },
+                json={"details": details},
+                timeout=90,
+            )
+            response.raise_for_status()
+            matches = response.json().get("matches", [])
+        except Exception as err:
+            for index in chunk:
+                results[index] = {**blank_apollo(), "Apollo Status": f"Lookup failed: {str(err)[:60]}"}
+            matches = []
+
+        # Apollo returns matches in the order submitted, with nulls for misses.
+        for position, index in enumerate(chunk):
+            person = matches[position] if position < len(matches) else None
+            results[index] = apollo_status(df.loc[index], person)
+
+        if progress is not None:
+            progress.progress(min((batch_start + APOLLO_BATCH_SIZE) / len(targets), 1.0))
+
+    enriched = pd.DataFrame.from_dict(results, orient="index")
+    return df.join(enriched)
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
@@ -748,6 +894,93 @@ def render_contact_section(working_df: pd.DataFrame, file_key: str) -> pd.DataFr
     return checked_df
 
 
+def render_apollo_section(working_df: pd.DataFrame, file_key: str) -> pd.DataFrame:
+    """Draw the Apollo cross-check controls."""
+    st.subheader("Cross-check contacts against Apollo")
+
+    if not APOLLO_API_KEY:
+        st.info(
+            "No Apollo key found. Generate one in Apollo under Settings > "
+            "Integrations > API, then add APOLLO_API_KEY in the app's Secrets."
+        )
+        return working_df
+
+    named = int(
+        working_df["Executive Last Name"].fillna("").astype(str).str.strip().ne("").sum()
+    ) if "Executive Last Name" in working_df.columns else 0
+
+    if not named:
+        st.info("No executive names in this list to check.")
+        return working_df
+
+    limit = st.slider(
+        "How many contacts to check",
+        min_value=10,
+        max_value=min(500, max(10, len(working_df))),
+        value=min(DEFAULT_APOLLO_LIMIT, len(working_df)),
+        step=10,
+        help="Apollo charges one credit per record it matches.",
+    )
+
+    st.caption(
+        f"{named:,} rows have a name. Checking {limit} of them costs up to "
+        f"{limit} Apollo credits and takes about {-(-limit // APOLLO_BATCH_SIZE)} calls."
+    )
+
+    cache_key = f"apollo::{file_key}::{len(working_df)}::{limit}"
+
+    if st.button(f"Check {limit} contacts against Apollo"):
+        progress = st.progress(0.0)
+        try:
+            st.session_state[cache_key] = apollo_bulk_match(
+                working_df, APOLLO_API_KEY, limit, progress
+            )
+        except Exception as err:
+            st.error(f"Apollo lookup failed: {err}")
+            st.caption("A 401 means the key is wrong; a 403 usually means the plan lacks API access.")
+            return working_df
+        finally:
+            progress.empty()
+
+    if cache_key not in st.session_state:
+        return working_df
+
+    apollo_df = st.session_state[cache_key]
+    counts = apollo_df["Apollo Status"].value_counts()
+
+    stat_a, stat_b, stat_c, stat_d = st.columns(4)
+    stat_a.metric("Still listed", f"{counts.get('Still listed', 0):,}")
+    stat_b.metric("Moved on", f"{counts.get('Moved on', 0):,}")
+    stat_c.metric("Title changed", f"{counts.get('Title changed', 0):,}")
+    stat_d.metric("Not in Apollo", f"{counts.get('Not in Apollo', 0):,}")
+
+    departed = apollo_df[apollo_df["Apollo Status"] == "Moved on"]
+    if not departed.empty:
+        with st.expander(f"See the {len(departed):,} contacts Apollo places elsewhere"):
+            st.dataframe(
+                departed[[
+                    "Company Name", "Executive First Name", "Executive Last Name",
+                    "Executive Title", "Apollo Current Employer", "Apollo Current Title",
+                ]],
+                use_container_width=True,
+                hide_index=True,
+            )
+        st.download_button(
+            f"Download the {len(departed):,} out-of-date contacts",
+            data=departed.to_csv(index=False).encode("utf-8"),
+            file_name=f"outdated_contacts_{file_key}",
+            mime="text/csv",
+        )
+
+    if st.checkbox("Show only contacts Apollo still places at the company", value=False):
+        apollo_df = apollo_df[
+            apollo_df["Apollo Status"].isin(["Still listed", "Title changed"])
+        ].copy()
+        st.caption(f"{len(apollo_df):,} leads with a contact Apollo confirms.")
+
+    return apollo_df
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
 
@@ -830,6 +1063,9 @@ def main() -> None:
 
     # --- Contact verification ---
     working_df = render_contact_section(working_df, uploaded_file.name)
+
+    # --- Apollo cross-check ---
+    working_df = render_apollo_section(working_df, uploaded_file.name)
 
     st.subheader("Leads")
     st.dataframe(working_df.head(MAX_PREVIEW_ROWS), use_container_width=True)
