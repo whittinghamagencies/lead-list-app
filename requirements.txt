@@ -1,2 +1,3 @@
 streamlit
 pandas
+smartystreets_python_sdk
