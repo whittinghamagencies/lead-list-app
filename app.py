@@ -6,10 +6,11 @@ Four stages, run in order. Each one narrows the list:
 
     1. Size      - drop companies below a headcount threshold
     2. Address   - verify mailing addresses, keep commercial ones
-    3. Contacts  - confirm / correct / flag the decision maker
-                     green  = same person, still there
-                     yellow = corrected with new data from Apollo
-                     red    = nobody found, set aside
+    3. Contacts  - verify, update, or set aside the decision maker
+                     green  = same person, confirmed still there
+                     yellow = updated with a new name found online
+                     grey   = business found, no names published
+                     red    = nothing found, set aside
     4. Score     - rank the remaining leads, red ones excluded
 
 Run with:  streamlit run app.py
@@ -63,32 +64,36 @@ DEFAULT_MIN_EMPLOYEES = 5
 MAX_PREVIEW_ROWS = 500
 SMARTY_BATCH_SIZE = 100
 
-# Apollo endpoints. Organization Search costs 1 credit per page; People
-# Search costs nothing, which is why the contact stage leans on it.
-APOLLO_ORG_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_companies/search"
-APOLLO_PEOPLE_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/api_search"
-
-# Who counts as a decision maker for a worksite benefits conversation.
-DM_SENIORITIES = ["owner", "founder", "c_suite", "vp", "head", "director", "manager"]
-DM_TITLES = [
-    "owner", "president", "chief executive officer", "general manager",
-    "human resources director", "human resources manager", "office manager",
-    "controller", "chief financial officer", "vice president",
-]
+# Titles that can approve a benefits decision at a small or mid-size employer.
+DM_TITLES = (
+    "owner, president, CEO, general manager, HR director, HR manager, "
+    "office manager, controller, CFO, vice president"
+)
 
 # Stage 3 statuses and their colors.
-STATUS_CONFIRMED = "Confirmed"
-STATUS_CORRECTED = "Corrected"
-STATUS_MISSING = "Missing"
+STATUS_CONFIRMED = "Verified"      # our listed contact was found, still there
+STATUS_CORRECTED = "Updated"       # a different decision maker was found
+STATUS_UNVERIFIED = "Unverified"   # company found, no personnel info published
+STATUS_MISSING = "Missing"         # no company presence and no name to work with
 
 STATUS_COLORS = {
     STATUS_CONFIRMED: "#d4f4dd",   # green
     STATUS_CORRECTED: "#fdf3c8",   # yellow
+    STATUS_UNVERIFIED: "#e6e8eb",  # grey
     STATUS_MISSING: "#fbd5d5",     # red
 }
 
+# Statuses that carry a usable name into scoring.
+ACTIONABLE_STATUSES = (STATUS_CONFIRMED, STATUS_CORRECTED)
+
 XAI_URL = "https://api.x.ai/v1/chat/completions"
+XAI_RESPONSES_URL = "https://api.x.ai/v1/responses"   # agentic endpoint, has web_search
 XAI_MODEL = "grok-4.5"
+
+# Contact lookups are the expensive stage, so they are batched: several
+# companies per agentic call rather than one call each.
+CONTACT_BATCH_SIZE = 4
+CONTACT_MAX_TOKENS = 600      # replies are compact JSON, so cap them hard
 SCORING_BATCH_SIZE = 15
 
 DEFAULT_SCORING_CRITERIA = """We sell voluntary worksite benefits to employers,
@@ -107,14 +112,13 @@ industries with mostly part-time or transient staff."""
 def get_secret(name: str, default: str = "") -> str:
     """Read st.secrets without crashing when the key isn't set."""
     try:
-        return st.secrets[name]
+        return str(st.secrets[name]).strip()  # a pasted newline causes a 401
     except Exception:
         return default
 
 
 SMARTY_AUTH_ID = get_secret("SMARTY_AUTH_ID")
 SMARTY_AUTH_TOKEN = get_secret("SMARTY_AUTH_TOKEN")
-APOLLO_API_KEY = get_secret("APOLLO_API_KEY")
 XAI_API_KEY = get_secret("XAI_API_KEY")
 
 
@@ -308,273 +312,268 @@ def keep_commercial(df: pd.DataFrame, drop_po_boxes: bool = True) -> pd.DataFram
 
 
 # ===========================================================================
-# Stage 3 - Decision maker resolution (Apollo)
+# Stage 3 - Decision maker resolution (Grok with web search)
 # ===========================================================================
+#
+# Token strategy:
+#   - Several companies per call, so one system prompt covers a batch
+#     instead of being repaid for every company.
+#   - Compact single-letter status codes and short field names in the reply.
+#   - A hard max_tokens ceiling, since the reply is small JSON either way.
+#   - Results cached per company name, so duplicates and reruns cost nothing.
+#   - A search order in the prompt, so the model finds the answer on the first
+#     or second search rather than wandering.
 
-COMPANY_NOISE = {
-    "inc", "llc", "ltd", "co", "corp", "corporation", "company", "the",
-    "svc", "svcs", "service", "services", "group", "holdings", "and", "of",
+CONTACT_SYSTEM_PROMPT = (
+    "You verify business decision makers using web search. "
+    "Search each company separately. Prefer, in order: (1) the company's own "
+    "website - about, team, staff, contact, or leadership pages; "
+    "(2) state business filings and Secretary of State registries, which list "
+    "owners, officers, and registered agents for small businesses; "
+    "(3) local chamber of commerce and licensing board listings; "
+    "(4) LinkedIn or business directories. "
+    "Use the phone number and address given to confirm you have the right "
+    "business, not a same-named company elsewhere. "
+    "Never guess a name from the company name. Never invent a person. "
+    "Reply with a JSON array only - no prose, no markdown fences. "
+    'Each element: {"i":<id>,"s":"<V|C|U|M>","n":"<First Last or empty>",'
+    '"t":"<title or empty>","u":"<source URL or empty>"}. '
+    "Status codes: "
+    "V = the person named in the record was found currently at this company. "
+    "C = that person was not found, but a different current decision maker was, "
+    "so you are correcting the record - put the new name in n. "
+    "U = the business exists online but publishes no personnel information. "
+    "M = no evidence the business exists online at all. "
+    "Use U, never C or M, when you simply could not find personnel details. "
+    "Absence of information is never proof someone left."
+)
+
+# Maps the model's single letters back to our status names.
+STATUS_CODES = {
+    "V": STATUS_CONFIRMED,
+    "C": STATUS_CORRECTED,
+    "U": STATUS_UNVERIFIED,
+    "M": STATUS_MISSING,
 }
 
 
-def apollo_post(url: str, payload: dict, api_key: str) -> dict:
-    """POST to Apollo with header auth. Query-param auth stopped working in 2024."""
+def contact_prompt_line(index, row) -> str:
+    """
+    One compact line describing a company to check.
+
+    Includes phone and address because they disambiguate a local business far
+    better than the name alone, and cost only a few tokens.
+    """
+    first = str(row.get("Executive First Name", "") or "").strip()
+    last = str(row.get("Executive Last Name", "") or "").strip()
+    title = str(row.get("Executive Title", "") or "").strip()
+    listed = f"{first} {last}".strip()
+
+    parts = [
+        f"id={index}",
+        str(row.get("Company Name", "") or ""),
+        f"{row.get('Verified Address') or row.get(STREET_COLUMN) or ''}",
+        f"{row.get(CITY_COLUMN, '')} {row.get(STATE_COLUMN, '')}".strip(),
+        str(row.get("Phone Number Combined", "") or ""),
+    ]
+
+    if listed:
+        parts.append(f"record says: {listed}" + (f", {title}" if title else ""))
+    else:
+        parts.append(f"record has no name - find a {DM_TITLES.split(',')[0]} or similar")
+
+    return " | ".join(part for part in parts if part)
+
+
+def call_grok_search(prompt: str, api_key: str) -> str:
+    """
+    One agentic call with web search enabled.
+
+    Uses the /v1/responses endpoint because the older search_parameters API
+    was retired in January 2026 and now returns 410.
+    """
     response = requests.post(
-        url,
-        headers={
-            "x-api-key": api_key,
-            "Content-Type": "application/json",
-            "Cache-Control": "no-cache",
+        XAI_RESPONSES_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": XAI_MODEL,
+            "input": [
+                {"role": "system", "content": CONTACT_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "tools": [{"type": "web_search"}],
+            "max_output_tokens": CONTACT_MAX_TOKENS,
         },
-        json=payload,
-        timeout=60,
+        timeout=240,
     )
     response.raise_for_status()
-    return response.json()
+    payload = response.json()
+
+    # output is a list of items - tool calls, reasoning, messages - so collect
+    # text from whichever items carry it rather than assuming a position.
+    chunks = []
+    for item in payload.get("output", []):
+        for part in item.get("content", []) or []:
+            if part.get("text"):
+                chunks.append(part["text"])
+    return "\n".join(chunks).strip()
 
 
-def find_organization(company: str, city: str, state: str, api_key: str) -> dict:
-    """
-    Look up a company in Apollo to get its id and domain.
+def parse_contact_reply(raw: str) -> dict:
+    """Turn the compact JSON reply into {row_id: fields}."""
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("```")[1]
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
 
-    Apollo expects a plain place name for organization_locations - "frankfort"
-    or "kentucky", never "Frankfort, KY". A filter that matches nothing
-    returns zero results, so we try narrow first and then fall back to the
-    name alone rather than reporting the company as absent.
+    # Tolerate a stray sentence before or after the array.
+    if "[" in cleaned and "]" in cleaned:
+        cleaned = cleaned[cleaned.index("["):cleaned.rindex("]") + 1]
 
-    Costs 1 credit per call, so callers cache by company name.
-    """
-    attempts = []
-    if city:
-        attempts.append({"q_organization_name": company, "per_page": 1,
-                         "organization_locations": [city.strip().lower()]})
-    attempts.append({"q_organization_name": company, "per_page": 1})
-
-    for payload in attempts:
-        body = apollo_post(APOLLO_ORG_SEARCH_URL, payload, api_key)
-        candidates = body.get("organizations") or body.get("accounts") or []
-        if not candidates:
-            continue
-
-        org = candidates[0]
-        domain = org.get("primary_domain") or ""
-        if not domain and org.get("website_url"):
-            domain = (
-                org["website_url"].replace("https://", "").replace("http://", "")
-                .replace("www.", "").split("/")[0]
-            )
-
-        return {
-            "id": org.get("id") or org.get("organization_id") or "",
-            "domain": domain,
-            "name": org.get("name") or "",
-            "matched_on": "name + city" if "organization_locations" in payload else "name only",
-        }
-
-    return {}
-
-
-def find_decision_makers(organization: dict, api_key: str) -> list:
-    """
-    Pull current decision makers at a company. Costs 0 credits.
-
-    Apollo's docs write array parameters with brackets (person_titles[]).
-    Plain keys usually work through the JSON body, but not always, so if the
-    first shape comes back empty we retry with the bracketed names before
-    concluding there is nobody there.
-    """
-    base = {
-        "person_seniorities": DM_SENIORITIES,
-        "person_titles": DM_TITLES,
-        "include_similar_titles": True,
-        "per_page": 10,
-    }
-
-    if organization.get("id"):
-        base["organization_ids"] = [organization["id"]]
-    elif organization.get("domain"):
-        base["q_organization_domains_list"] = [organization["domain"]]
-    else:
-        return []
-
-    bracketed = {
-        (key + "[]" if isinstance(value, list) else key): value
-        for key, value in base.items()
-    }
-
-    for payload in (base, bracketed):
+    parsed = {}
+    for item in json.loads(cleaned):
         try:
-            body = apollo_post(APOLLO_PEOPLE_SEARCH_URL, payload, api_key)
-        except Exception:
+            parsed[int(item["i"])] = {
+                "status": STATUS_CODES.get(str(item.get("s", "")).upper()[:1], STATUS_UNVERIFIED),
+                "name": str(item.get("n", "")).strip(),
+                "title": str(item.get("t", "")).strip(),
+                "url": str(item.get("u", "")).strip(),
+            }
+        except (KeyError, ValueError, TypeError):
             continue
-
-        people = body.get("people") or body.get("contacts") or []
-        if people:
-            return people
-
-    return []
-
-
-def names_match(our_first: str, our_last: str, their_first: str, their_last: str) -> bool:
-    """
-    Same person? Last name must match; first name matches on first initial.
-
-    The initial-only rule catches Mike/Michael and Bob/Robert, which show up
-    constantly between a purchased list and a maintained database.
-    """
-    our_last, their_last = our_last.strip().lower(), their_last.strip().lower()
-    if not our_last or our_last != their_last:
-        return False
-
-    our_first, their_first = our_first.strip().lower(), their_first.strip().lower()
-    if not our_first or not their_first:
-        return True  # last name matched and one first name is blank
-
-    return our_first[0] == their_first[0]
-
-
-def rank_decision_maker(person: dict) -> int:
-    """
-    Sort key for choosing which decision maker to suggest.
-
-    Owners and presidents outrank HR, which outranks a generic manager.
-    """
-    title = (person.get("title") or "").lower()
-    for rank, keyword in enumerate([
-        "owner", "president", "chief executive", "ceo",
-        "human resources", "hr ", "general manager", "controller",
-        "chief financial", "vice president", "director", "manager",
-    ]):
-        if keyword in title:
-            return rank
-    return 99
+    return parsed
 
 
 def blank_contact() -> dict:
     return {
         "Contact Status": "",
-        "Contact Note": "",
         "Current First Name": "",
         "Current Last Name": "",
         "Current Title": "",
-        "Current LinkedIn": "",
-        "Apollo Domain": "",
+        "Contact Source": "",
+        "Contact Note": "",
     }
 
 
-def resolve_one_contact(row, organization: dict, people: list) -> dict:
-    """
-    Decide the contact status for one lead.
+def split_name(full_name: str):
+    """Split a returned full name into first and last."""
+    parts = [part for part in full_name.replace(",", " ").split() if part]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[-1]
 
-    Confirmed - our listed person is among the company's current decision makers
-    Corrected - our person isn't, but Apollo has someone else who is
-    Missing   - Apollo has nobody, so there is no one to ask for by name
+
+def apply_contact_result(row, result: dict) -> dict:
     """
+    Turn one parsed result into our contact columns.
+
+    Guards against the model returning status C with no name, which would
+    otherwise produce a yellow row with nothing to call.
+    """
+    contact = blank_contact()
+    status = result.get("status", STATUS_UNVERIFIED)
+    first, last = split_name(result.get("name", ""))
+
     our_first = str(row.get("Executive First Name", "") or "").strip()
     our_last = str(row.get("Executive Last Name", "") or "").strip()
-    our_title = str(row.get("Executive Title", "") or "").strip()
-
-    result = blank_contact()
-    result["Apollo Domain"] = organization.get("domain", "")
-
-    if not people:
-        result["Contact Status"] = STATUS_MISSING
-        result["Contact Note"] = (
-            "No decision maker on file in Apollo"
-            if organization else "Company not found in Apollo"
-        )
-        return result
-
-    # Is our person still listed?
-    for person in people:
-        if names_match(our_first, our_last,
-                       person.get("first_name", "") or "",
-                       person.get("last_name", "") or ""):
-            their_title = person.get("title") or ""
-            result.update({
-                "Contact Status": STATUS_CONFIRMED,
-                "Current First Name": person.get("first_name") or "",
-                "Current Last Name": person.get("last_name") or "",
-                "Current Title": their_title,
-                "Current LinkedIn": person.get("linkedin_url") or "",
-            })
-            # Same person, different title - still confirmed, but say so.
-            if our_title and their_title and our_title.lower() not in their_title.lower():
-                result["Contact Note"] = f"Title now {their_title} (list said {our_title})"
-            else:
-                result["Contact Note"] = "Listed contact confirmed"
-            return result
-
-    # Our person isn't there. Offer the best decision maker Apollo does have.
-    best = sorted(people, key=rank_decision_maker)[0]
     had_name = bool(our_first or our_last)
 
-    result.update({
-        "Contact Status": STATUS_CORRECTED,
-        "Current First Name": best.get("first_name") or "",
-        "Current Last Name": best.get("last_name") or "",
-        "Current Title": best.get("title") or "",
-        "Current LinkedIn": best.get("linkedin_url") or "",
-        "Contact Note": (
-            f"Replaces {our_first} {our_last}".strip() if had_name
-            else "New contact - list had no name"
-        ),
+    # A correction with no name isn't a correction.
+    if status == STATUS_CORRECTED and not (first or last):
+        status = STATUS_UNVERIFIED
+
+    # Verified means our person - keep ours if the model echoed nothing.
+    if status == STATUS_CONFIRMED and not (first or last):
+        first, last = our_first, our_last
+
+    # No name anywhere, and nothing found: that's a set-aside, not unverified.
+    if status == STATUS_UNVERIFIED and not had_name:
+        status = STATUS_MISSING
+
+    contact.update({
+        "Contact Status": status,
+        "Current First Name": first,
+        "Current Last Name": last,
+        "Current Title": result.get("title", ""),
+        "Contact Source": result.get("url", ""),
     })
-    return result
+
+    if status == STATUS_CONFIRMED:
+        contact["Contact Note"] = "Listed contact confirmed"
+    elif status == STATUS_CORRECTED:
+        contact["Contact Note"] = (
+            f"Replaces {our_first} {our_last}".strip() if had_name
+            else "New contact - record had no name"
+        )
+    elif status == STATUS_UNVERIFIED:
+        contact["Contact Note"] = "Business found, no personnel published"
+    else:
+        contact["Contact Note"] = "No web presence found"
+
+    return contact
 
 
 def resolve_contacts(df: pd.DataFrame, api_key: str, limit: int, progress=None):
     """
-    Resolve decision makers for the first `limit` rows.
+    Resolve decision makers for the first `limit` rows, cheapest path first.
 
-    Two calls per company: one paid org lookup (cached by company name) and
-    one free people search. Rows past the limit come back blank.
+    Companies are batched CONTACT_BATCH_SIZE per call, and every result is
+    cached by company name so a rerun or a duplicate company costs nothing.
+    Returns (dataframe, diagnostics).
     """
     results = {index: blank_contact() for index in df.index}
-    diagnostics = {"orgs_found": 0, "orgs_tried": 0, "people_found": 0, "errors": []}
+    diagnostics = {"calls": 0, "cached": 0, "checked": 0, "errors": []}
 
-    org_cache = st.session_state.setdefault("apollo_org_cache", {})
+    cache = st.session_state.setdefault("grok_contact_cache", {})
     targets = list(df.index)[:limit]
 
-    for position, index in enumerate(targets):
+    # Reuse anything already resolved for the same company name.
+    pending = []
+    for index in targets:
         company = str(df.at[index, "Company Name"] or "").strip()
         if not company:
             results[index]["Contact Status"] = STATUS_MISSING
             results[index]["Contact Note"] = "No company name"
             continue
+        if company in cache:
+            results[index] = apply_contact_result(df.loc[index], cache[company])
+            diagnostics["cached"] += 1
+        else:
+            pending.append(index)
+
+    for start in range(0, len(pending), CONTACT_BATCH_SIZE):
+        chunk = pending[start:start + CONTACT_BATCH_SIZE]
+        prompt = "Check each business:\n" + "\n".join(
+            contact_prompt_line(index, df.loc[index]) for index in chunk
+        )
 
         try:
-            if company not in org_cache:
-                diagnostics["orgs_tried"] += 1
-                organization = find_organization(
-                    company,
-                    str(df.at[index, CITY_COLUMN] or "").strip(),
-                    str(df.at[index, STATE_COLUMN] or "").strip(),
-                    api_key,
-                )
-                org_cache[company] = {
-                    "organization": organization,
-                    "people": find_decision_makers(organization, api_key) if organization else [],
-                }
-
-            cached = org_cache[company]
-            if cached["organization"]:
-                diagnostics["orgs_found"] += 1
-            diagnostics["people_found"] += len(cached["people"])
-
-            results[index] = resolve_one_contact(
-                df.loc[index], cached["organization"], cached["people"]
-            )
+            parsed = parse_contact_reply(call_grok_search(prompt, api_key))
+            diagnostics["calls"] += 1
         except Exception as err:
-            results[index]["Contact Status"] = STATUS_MISSING
-            results[index]["Contact Note"] = f"Lookup failed: {str(err)[:60]}"
+            parsed = {}
             if len(diagnostics["errors"]) < 3:
-                diagnostics["errors"].append(str(err)[:100])
+                diagnostics["errors"].append(str(err)[:120])
+
+        for index in chunk:
+            result = parsed.get(index)
+            if result is None:
+                results[index]["Contact Status"] = STATUS_UNVERIFIED
+                results[index]["Contact Note"] = "No result returned - rerun to retry"
+                continue
+
+            results[index] = apply_contact_result(df.loc[index], result)
+            cache[str(df.at[index, "Company Name"] or "").strip()] = result
+            diagnostics["checked"] += 1
 
         if progress is not None:
-            progress.progress((position + 1) / max(len(targets), 1))
+            progress.progress(min((start + CONTACT_BATCH_SIZE) / max(len(pending), 1), 1.0))
 
     return df.join(pd.DataFrame.from_dict(results, orient="index")), diagnostics
+
 
 
 def color_status(df: pd.DataFrame):
@@ -777,102 +776,47 @@ def stage_two_address(working_df: pd.DataFrame, file_key: str) -> pd.DataFrame:
     return commercial
 
 
-def apollo_test_panel(working_df: pd.DataFrame) -> None:
-    """
-    Run one company through Apollo and show the raw result.
-
-    Apollo returns 200 with empty lists rather than errors, so the only
-    reliable way to tell "not in the database" from "our request was wrong"
-    is to look at what actually comes back.
-    """
-    with st.expander("Test Apollo on one company"):
-        default = str(working_df["Company Name"].iloc[0]) if len(working_df) else ""
-        left, right = st.columns(2)
-        company = left.text_input("Company name", value=default)
-        city = right.text_input(
-            "City",
-            value=str(working_df[CITY_COLUMN].iloc[0]) if len(working_df) else "",
-        )
-
-        if not st.button("Run test"):
-            return
-
-        try:
-            organization = find_organization(company, city, "", APOLLO_API_KEY)
-        except Exception as err:
-            st.error(f"Company search failed: {err}")
-            st.caption(
-                "401 = bad key. 403 = the key lacks the mixed_companies/search "
-                "scope, or the plan has no API access. 429 = rate limited."
-            )
-            return
-
-        if not organization:
-            st.warning("Apollo has no company matching that name. Nothing else can run.")
-            return
-
-        st.success(f"Matched on {organization['matched_on']}")
-        st.write({"Apollo name": organization["name"], "Domain": organization["domain"],
-                  "Apollo id": organization["id"]})
-
-        try:
-            people = find_decision_makers(organization, APOLLO_API_KEY)
-        except Exception as err:
-            st.error(f"Decision maker search failed: {err}")
-            return
-
-        if not people:
-            st.warning(
-                "Company found, but Apollo returned no decision makers. Either it "
-                "holds no senior contacts for this business, or the key lacks the "
-                "mixed_people/api_search scope."
-            )
-            return
-
-        st.success(f"{len(people)} decision maker(s) found")
-        st.dataframe(
-            pd.DataFrame([
-                {"First": p.get("first_name", ""), "Last": p.get("last_name", ""),
-                 "Title": p.get("title", "")}
-                for p in people
-            ]),
-            use_container_width=True, hide_index=True,
-        )
-
-
 def stage_three_contacts(working_df: pd.DataFrame, file_key: str):
-    """Stage 3: confirm, correct, or flag the decision maker."""
+    """Stage 3: verify, update, or set aside the decision maker."""
     st.subheader("3. Decision maker")
 
-    if not APOLLO_API_KEY:
-        st.info(
-            "No Apollo key. Generate one under Settings > Integrations > API "
-            "with the mixed_companies/search and mixed_people/api_search scopes, "
-            "then add APOLLO_API_KEY to Secrets."
-        )
+    if not XAI_API_KEY:
+        st.info("No xAI key. Add XAI_API_KEY to Secrets to enable contact lookups.")
         return working_df, None
 
-    limit = st.slider(
-        "How many companies to resolve", min_value=10,
-        max_value=min(500, max(10, len(working_df))),
-        value=min(50, len(working_df)), step=10,
-        help="Largest employers first. One paid company lookup each; the "
-             "decision maker search itself is free.",
+    st.caption(
+        "Searches company websites and state business filings for whoever can "
+        "approve a benefits decision. Confirms the name on file, replaces it "
+        "when it's stale, and fills one in when the record has none."
     )
 
-    apollo_test_panel(working_df)
+    cached_companies = len(st.session_state.get("grok_contact_cache", {}))
+
+    left, right = st.columns([2, 1])
+    limit = left.slider(
+        "How many companies to check", min_value=5,
+        max_value=min(200, max(5, len(working_df))),
+        value=min(25, len(working_df)), step=5,
+        help="Largest employers first. Batched several per call to keep token use down.",
+    )
+    right.metric("Already cached", f"{cached_companies:,}")
+
+    calls = -(-limit // CONTACT_BATCH_SIZE)
+    st.caption(
+        f"About {calls} search call(s) for {limit} companies "
+        f"({CONTACT_BATCH_SIZE} per call). Companies already checked are free."
+    )
 
     cache_key = f"contacts::{file_key}::{len(working_df)}::{limit}"
 
-    if st.button(f"Resolve {limit} decision makers", type="primary"):
+    if st.button(f"Check {limit} companies", type="primary"):
         progress = st.progress(0.0)
         try:
             st.session_state[cache_key] = resolve_contacts(
-                working_df, APOLLO_API_KEY, limit, progress
+                working_df, XAI_API_KEY, limit, progress
             )
         except Exception as err:
-            st.error(f"Apollo lookup failed: {err}")
-            st.caption("401 means the key is wrong; 403 usually means a missing scope or plan.")
+            st.error(f"Contact lookup failed: {err}")
             return working_df, None
         finally:
             progress.empty()
@@ -883,51 +827,62 @@ def stage_three_contacts(working_df: pd.DataFrame, file_key: str):
     resolved, diagnostics = st.session_state[cache_key]
     counts = resolved["Contact Status"].value_counts()
 
-    a, b, c = st.columns(3)
-    a.metric("Confirmed", f"{counts.get(STATUS_CONFIRMED, 0):,}", help="Listed contact still there")
-    b.metric("Corrected", f"{counts.get(STATUS_CORRECTED, 0):,}", help="New name from Apollo")
-    c.metric("Missing", f"{counts.get(STATUS_MISSING, 0):,}", help="No decision maker found")
+    a, b, c, d = st.columns(4)
+    a.metric("Verified", f"{counts.get(STATUS_CONFIRMED, 0):,}",
+             help="Name on file confirmed at the company")
+    b.metric("Updated", f"{counts.get(STATUS_CORRECTED, 0):,}",
+             help="A different current decision maker was found")
+    c.metric("Unverified", f"{counts.get(STATUS_UNVERIFIED, 0):,}",
+             help="Business exists but publishes no names")
+    d.metric("Missing", f"{counts.get(STATUS_MISSING, 0):,}",
+             help="No web presence and no name to work with")
 
-    with st.expander("What Apollo reported"):
+    with st.expander("Search cost"):
         st.write({
-            "Companies looked up": diagnostics["orgs_tried"],
-            "Companies found in Apollo": diagnostics["orgs_found"],
-            "Decision makers returned": diagnostics["people_found"],
+            "Search calls made": diagnostics["calls"],
+            "Companies newly checked": diagnostics["checked"],
+            "Companies served from cache": diagnostics["cached"],
         })
-        st.write("Why rows came back Missing:")
-        st.dataframe(
-            resolved[resolved["Contact Status"] == STATUS_MISSING]["Contact Note"]
-            .value_counts().rename_axis("Reason").reset_index(name="Rows"),
-            use_container_width=True, hide_index=True,
-        )
         for message in diagnostics["errors"]:
             st.error(message)
-        if diagnostics["orgs_tried"] and not diagnostics["orgs_found"]:
-            st.warning(
-                "No companies matched. Either they aren't in Apollo, or the key "
-                "lacks the mixed_companies/search scope."
-            )
 
-    corrected = resolved[resolved["Contact Status"] == STATUS_CORRECTED]
-    if not corrected.empty:
-        with st.expander(f"Review the {len(corrected):,} corrected contacts"):
+    updated = resolved[resolved["Contact Status"] == STATUS_CORRECTED]
+    if not updated.empty:
+        with st.expander(f"Review the {len(updated):,} updated contacts"):
             st.dataframe(
-                corrected[[
+                updated[[
                     "Company Name", "Executive First Name", "Executive Last Name",
                     "Executive Title", "Current First Name", "Current Last Name",
-                    "Current Title", "Contact Note",
+                    "Current Title", "Contact Source",
                 ]],
                 use_container_width=True, hide_index=True,
             )
+        st.caption(
+            "Open a source link before a setter calls - these are web findings, "
+            "not a maintained database."
+        )
 
-    # Red rows go no further - no name means no one to ask for.
-    missing = resolved[resolved["Contact Status"] == STATUS_MISSING]
-    actionable = resolved[resolved["Contact Status"] != STATUS_MISSING].copy()
+    # Which statuses carry forward is a judgement call, so make it one.
+    keep_unverified = st.checkbox(
+        "Also keep unverified companies (name on file, nothing found online)",
+        value=True,
+        help="These still have your original contact. Turn off to work only "
+             "names that were confirmed or corrected.",
+    )
 
-    if not missing.empty:
-        download_row(missing, "Download set-aside leads (no contact)", f"no_contact_{file_key}")
+    allowed = list(ACTIONABLE_STATUSES)
+    if keep_unverified:
+        allowed.append(STATUS_UNVERIFIED)
 
-    return actionable, missing
+    actionable = resolved[resolved["Contact Status"].isin(allowed)].copy()
+    set_aside = resolved[~resolved["Contact Status"].isin(allowed)].copy()
+
+    st.caption(f"{len(actionable):,} leads carried into scoring, {len(set_aside):,} set aside.")
+
+    if not set_aside.empty:
+        download_row(set_aside, "Download set-aside leads", f"set_aside_{file_key}")
+
+    return actionable, set_aside
 
 
 def stage_four_score(working_df: pd.DataFrame, file_key: str) -> pd.DataFrame:
@@ -1032,8 +987,8 @@ def main() -> None:
 
     if set_aside is not None and not set_aside.empty:
         st.caption(
-            f"{len(working_df):,} leads with a usable contact. "
-            f"{len(set_aside):,} set aside with no decision maker."
+            f"{len(working_df):,} leads carried forward, "
+            f"{len(set_aside):,} set aside."
         )
 
     st.dataframe(color_status(working_df.head(MAX_PREVIEW_ROWS)), use_container_width=True)
