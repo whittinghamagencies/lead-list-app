@@ -337,54 +337,82 @@ def find_organization(company: str, city: str, state: str, api_key: str) -> dict
     """
     Look up a company in Apollo to get its id and domain.
 
-    Costs 1 credit per call, so callers cache by company name. Location
-    narrows the search so a same-named business elsewhere doesn't match.
+    Apollo expects a plain place name for organization_locations - "frankfort"
+    or "kentucky", never "Frankfort, KY". A filter that matches nothing
+    returns zero results, so we try narrow first and then fall back to the
+    name alone rather than reporting the company as absent.
+
+    Costs 1 credit per call, so callers cache by company name.
     """
-    payload = {"q_organization_name": company, "per_page": 1}
-    if city and state:
-        payload["organization_locations"] = [f"{city}, {state}"]
+    attempts = []
+    if city:
+        attempts.append({"q_organization_name": company, "per_page": 1,
+                         "organization_locations": [city.strip().lower()]})
+    attempts.append({"q_organization_name": company, "per_page": 1})
 
-    body = apollo_post(APOLLO_ORG_SEARCH_URL, payload, api_key)
-    candidates = body.get("organizations") or body.get("accounts") or []
-    if not candidates:
-        return {}
+    for payload in attempts:
+        body = apollo_post(APOLLO_ORG_SEARCH_URL, payload, api_key)
+        candidates = body.get("organizations") or body.get("accounts") or []
+        if not candidates:
+            continue
 
-    org = candidates[0]
-    domain = org.get("primary_domain") or ""
-    if not domain and org.get("website_url"):
-        domain = (
-            org["website_url"].replace("https://", "").replace("http://", "")
-            .replace("www.", "").split("/")[0]
-        )
+        org = candidates[0]
+        domain = org.get("primary_domain") or ""
+        if not domain and org.get("website_url"):
+            domain = (
+                org["website_url"].replace("https://", "").replace("http://", "")
+                .replace("www.", "").split("/")[0]
+            )
 
-    return {"id": org.get("id") or org.get("organization_id") or "", "domain": domain,
-            "name": org.get("name") or ""}
+        return {
+            "id": org.get("id") or org.get("organization_id") or "",
+            "domain": domain,
+            "name": org.get("name") or "",
+            "matched_on": "name + city" if "organization_locations" in payload else "name only",
+        }
+
+    return {}
 
 
 def find_decision_makers(organization: dict, api_key: str) -> list:
     """
     Pull current decision makers at a company. Costs 0 credits.
 
-    Filters by seniority and title so we get people who could actually
-    approve a benefits decision, not every employee on file.
+    Apollo's docs write array parameters with brackets (person_titles[]).
+    Plain keys usually work through the JSON body, but not always, so if the
+    first shape comes back empty we retry with the bracketed names before
+    concluding there is nobody there.
     """
-    payload = {
+    base = {
         "person_seniorities": DM_SENIORITIES,
         "person_titles": DM_TITLES,
         "include_similar_titles": True,
         "per_page": 10,
     }
 
-    # Prefer the Apollo org id; fall back to the domain.
     if organization.get("id"):
-        payload["organization_ids"] = [organization["id"]]
+        base["organization_ids"] = [organization["id"]]
     elif organization.get("domain"):
-        payload["q_organization_domains_list"] = [organization["domain"]]
+        base["q_organization_domains_list"] = [organization["domain"]]
     else:
         return []
 
-    body = apollo_post(APOLLO_PEOPLE_SEARCH_URL, payload, api_key)
-    return body.get("people") or body.get("contacts") or []
+    bracketed = {
+        (key + "[]" if isinstance(value, list) else key): value
+        for key, value in base.items()
+    }
+
+    for payload in (base, bracketed):
+        try:
+            body = apollo_post(APOLLO_PEOPLE_SEARCH_URL, payload, api_key)
+        except Exception:
+            continue
+
+        people = body.get("people") or body.get("contacts") or []
+        if people:
+            return people
+
+    return []
 
 
 def names_match(our_first: str, our_last: str, their_first: str, their_last: str) -> bool:
@@ -749,6 +777,69 @@ def stage_two_address(working_df: pd.DataFrame, file_key: str) -> pd.DataFrame:
     return commercial
 
 
+def apollo_test_panel(working_df: pd.DataFrame) -> None:
+    """
+    Run one company through Apollo and show the raw result.
+
+    Apollo returns 200 with empty lists rather than errors, so the only
+    reliable way to tell "not in the database" from "our request was wrong"
+    is to look at what actually comes back.
+    """
+    with st.expander("Test Apollo on one company"):
+        default = str(working_df["Company Name"].iloc[0]) if len(working_df) else ""
+        left, right = st.columns(2)
+        company = left.text_input("Company name", value=default)
+        city = right.text_input(
+            "City",
+            value=str(working_df[CITY_COLUMN].iloc[0]) if len(working_df) else "",
+        )
+
+        if not st.button("Run test"):
+            return
+
+        try:
+            organization = find_organization(company, city, "", APOLLO_API_KEY)
+        except Exception as err:
+            st.error(f"Company search failed: {err}")
+            st.caption(
+                "401 = bad key. 403 = the key lacks the mixed_companies/search "
+                "scope, or the plan has no API access. 429 = rate limited."
+            )
+            return
+
+        if not organization:
+            st.warning("Apollo has no company matching that name. Nothing else can run.")
+            return
+
+        st.success(f"Matched on {organization['matched_on']}")
+        st.write({"Apollo name": organization["name"], "Domain": organization["domain"],
+                  "Apollo id": organization["id"]})
+
+        try:
+            people = find_decision_makers(organization, APOLLO_API_KEY)
+        except Exception as err:
+            st.error(f"Decision maker search failed: {err}")
+            return
+
+        if not people:
+            st.warning(
+                "Company found, but Apollo returned no decision makers. Either it "
+                "holds no senior contacts for this business, or the key lacks the "
+                "mixed_people/api_search scope."
+            )
+            return
+
+        st.success(f"{len(people)} decision maker(s) found")
+        st.dataframe(
+            pd.DataFrame([
+                {"First": p.get("first_name", ""), "Last": p.get("last_name", ""),
+                 "Title": p.get("title", "")}
+                for p in people
+            ]),
+            use_container_width=True, hide_index=True,
+        )
+
+
 def stage_three_contacts(working_df: pd.DataFrame, file_key: str):
     """Stage 3: confirm, correct, or flag the decision maker."""
     st.subheader("3. Decision maker")
@@ -768,6 +859,8 @@ def stage_three_contacts(working_df: pd.DataFrame, file_key: str):
         help="Largest employers first. One paid company lookup each; the "
              "decision maker search itself is free.",
     )
+
+    apollo_test_panel(working_df)
 
     cache_key = f"contacts::{file_key}::{len(working_df)}::{limit}"
 
@@ -801,6 +894,12 @@ def stage_three_contacts(working_df: pd.DataFrame, file_key: str):
             "Companies found in Apollo": diagnostics["orgs_found"],
             "Decision makers returned": diagnostics["people_found"],
         })
+        st.write("Why rows came back Missing:")
+        st.dataframe(
+            resolved[resolved["Contact Status"] == STATUS_MISSING]["Contact Note"]
+            .value_counts().rename_axis("Reason").reset_index(name="Rows"),
+            use_container_width=True, hide_index=True,
+        )
         for message in diagnostics["errors"]:
             st.error(message)
         if diagnostics["orgs_tried"] and not diagnostics["orgs_found"]:
