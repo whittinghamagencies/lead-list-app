@@ -526,17 +526,69 @@ def business_to_columns(attributes) -> dict:
     }
 
 
+# Words that don't help decide whether two company names are the same business.
+COMPANY_NOISE = {
+    "inc", "llc", "ltd", "co", "corp", "corporation", "company", "the",
+    "svc", "svcs", "service", "services", "group", "holdings", "and", "of",
+}
+
+
+def normalize_company(name: str) -> set:
+    """Reduce a company name to its meaningful words for comparison."""
+    if not isinstance(name, str):
+        return set()
+
+    cleaned = "".join(char if char.isalnum() else " " for char in name.lower())
+    return {word for word in cleaned.split() if word and word not in COMPANY_NOISE}
+
+
+def same_company(ours: str, theirs: str) -> bool:
+    """
+    Whether two company names refer to the same business.
+
+    Compares meaningful words rather than exact strings, so "Aska USA" matches
+    "Aska USA Inc." but "Apollo Aviation" does not match "Apollo Roofing".
+    """
+    ours_words, theirs_words = normalize_company(ours), normalize_company(theirs)
+    if not ours_words or not theirs_words:
+        return False
+
+    overlap = len(ours_words & theirs_words)
+    return overlap / min(len(ours_words), len(theirs_words)) >= 0.6
+
+
+def pick_business_id(entries, company_name: str) -> str:
+    """
+    Choose which business at this address is ours.
+
+    One address can hold several businesses - a strip mall, a shared office -
+    so prefer a name match and only fall back to the single result when
+    there's exactly one.
+    """
+    if not entries:
+        return ""
+
+    for entry in entries:
+        if same_company(company_name, getattr(entry, "company_name", "") or ""):
+            return getattr(entry, "business_id", "") or ""
+
+    if len(entries) == 1:
+        return getattr(entries[0], "business_id", "") or ""
+
+    return ""   # several businesses, none matching by name - don't guess
+
+
 def enrich_businesses(df: pd.DataFrame, auth_id: str, auth_token: str,
                       license_name: str = "", limit: int = 0, progress=None):
     """
-    Look each company up in Smarty's business dataset by address and name.
+    Look each company up in Smarty's business dataset.
 
-    One lookup per company - there is no batch endpoint for this - so it is
-    capped and cached. Returns (dataframe, diagnostics).
+    Two steps, because the detail record is keyed by business_id:
+      1. search by address and company name  -> a list of businesses there
+      2. fetch the detail for the matching business_id
 
-    NOTE: this path has not been run against a live Enrichment subscription.
-    Field names come from the SDK, but check a handful of rows before
-    trusting a full run.
+    That means up to two lookups per company, so it is capped. Returns
+    (dataframe, diagnostics).
     """
     builder = ClientBuilder(StaticCredentials(auth_id, auth_token))
     licenses = [name.strip() for name in license_name.split(",") if name.strip()]
@@ -545,27 +597,54 @@ def enrich_businesses(df: pd.DataFrame, auth_id: str, auth_token: str,
     client = builder.build_us_enrichment_api_client()
 
     results = {index: blank_business() for index in df.index}
-    diagnostics = {"looked_up": 0, "matched": 0, "errors": []}
+    diagnostics = {
+        "searched": 0, "found_at_address": 0, "matched": 0,
+        "ambiguous": 0, "errors": [],
+    }
 
     targets = list(df.index)[:limit] if limit else list(df.index)
 
     for position, index in enumerate(targets):
-        lookup = us_enrichment.Lookup(
-            street=str(df.at[index, STREET_COLUMN] or ""),
-            city=str(df.at[index, CITY_COLUMN] or ""),
-            state=str(df.at[index, STATE_COLUMN] or ""),
-            zipcode=str(df.at[index, ZIP_COLUMN] or ""),
-            business_name=str(df.at[index, "Company Name"] or ""),
-        )
+        company = str(df.at[index, "Company Name"] or "")
 
         try:
-            diagnostics["looked_up"] += 1
-            found = client.send_business_detail_lookup(lookup)
-            if found:
-                record = found[0]
+            # Step 1 - what businesses are at this address?
+            search = us_enrichment.Lookup(
+                street=str(df.at[index, STREET_COLUMN] or ""),
+                city=str(df.at[index, CITY_COLUMN] or ""),
+                state=str(df.at[index, STATE_COLUMN] or ""),
+                zipcode=str(df.at[index, ZIP_COLUMN] or ""),
+                business_name=company,
+            )
+            diagnostics["searched"] += 1
+            found = client.send_business_lookup(search)
+
+            entries = []
+            for response in found or []:
+                entries.extend(getattr(response, "businesses", []) or [])
+
+            if entries:
+                diagnostics["found_at_address"] += 1
+
+            business_id = pick_business_id(entries, company)
+            if not business_id:
+                if len(entries) > 1:
+                    diagnostics["ambiguous"] += 1
+                    results[index]["Business Status"] = (
+                        f"{len(entries)} businesses at this address, none matching by name"
+                    )
+                continue
+
+            # Step 2 - the full record for that business.
+            detail = client.send_business_detail_lookup(
+                us_enrichment.BusinessDetailLookup(business_id)
+            )
+            if detail:
+                record = detail[0] if isinstance(detail, list) else detail
                 attributes = getattr(record, "attributes", record)
                 results[index] = business_to_columns(attributes)
                 diagnostics["matched"] += 1
+
         except Exception as err:
             if len(diagnostics["errors"]) < 3:
                 diagnostics["errors"].append(str(err)[:140])
@@ -1200,16 +1279,32 @@ def stage_two_business(working_df: pd.DataFrame, file_key: str) -> pd.DataFrame:
 
     enriched, diagnostics = st.session_state[cache_key]
 
-    a, b, c = st.columns(3)
-    a.metric("Looked up", f"{diagnostics['looked_up']:,}")
-    b.metric("Matched", f"{diagnostics['matched']:,}")
-    c.metric("With a contact name",
+    a, b, c, d = st.columns(4)
+    a.metric("Searched", f"{diagnostics['searched']:,}")
+    b.metric("Businesses at address", f"{diagnostics['found_at_address']:,}",
+             help="Smarty knows of a business there, matching by name or not.")
+    c.metric("Matched", f"{diagnostics['matched']:,}",
+             help="Name matched and the full record came back.")
+    d.metric("With a contact name",
              f"{int(enriched['Smarty Contact Last Name'].fillna('').astype(str).str.strip().ne('').sum()):,}")
+
+    if diagnostics["ambiguous"]:
+        st.info(
+            f"{diagnostics['ambiguous']:,} addresses had several businesses and none "
+            "matched your company name - skipped rather than guessed. Shared "
+            "buildings and strip malls do this."
+        )
 
     for message in diagnostics["errors"]:
         st.error(message)
 
-    if diagnostics["looked_up"] and not diagnostics["matched"]:
+    if diagnostics["searched"] and not diagnostics["found_at_address"]:
+        st.warning(
+            "No businesses found at any of these addresses. That usually means "
+            "the license string is wrong rather than the data being absent - "
+            "check the exact license on the Enrichment trial in your dashboard."
+        )
+    elif diagnostics["found_at_address"] and not diagnostics["matched"]:
         st.warning(
             "Nothing matched. Either the license is wrong or the business dataset "
             "has no record for these addresses. Check one company by hand in the "
