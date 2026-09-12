@@ -6,11 +6,14 @@ Four stages, run in order. Each one narrows the list:
 
     1. Size      - drop companies below a headcount threshold
     2. Address   - verify mailing addresses, keep commercial ones
-    3. Contacts  - confirm / correct / flag the decision maker
-                     green  = same person, still there
-                     yellow = corrected with new data from Apollo
-                     red    = nobody found, set aside
-    4. Score     - rank the remaining leads, red ones excluded
+    3. Industry  - prioritise blue collar work, exclude what you choose
+    4. Contacts  - verify, update, or set aside the decision maker
+                     green  = listed person confirmed still there
+                     yellow = updated with a new name found online
+                     grey   = business found, no names published
+                     red    = nothing found, set aside
+
+The output is a working call list, sorted blue collar and largest first.
 
 Run with:  streamlit run app.py
 Requires:  streamlit, pandas, requests, smartystreets_python_sdk
@@ -174,36 +177,66 @@ STATUS_COLORS = {
     STATUS_MISSING: "#fbd5d5",     # red
 }
 
-# Statuses that carry a usable name into scoring.
+# Statuses that carry a usable name into the working list.
 ACTIONABLE_STATUSES = (STATUS_CONFIRMED, STATUS_CORRECTED)
 
-XAI_URL = "https://api.x.ai/v1/chat/completions"
 XAI_RESPONSES_URL = "https://api.x.ai/v1/responses"   # agentic endpoint, has web_search
-XAI_MODEL = "grok-4.5"
+
+# Contact lookup is a retrieval task, not a reasoning one, so the cheaper
+# long-context model is the right default. Rates are per million tokens.
+CONTACT_MODELS = {
+    "grok-4-fast - cheapest": {
+        "id": "grok-4-fast-non-reasoning",
+        "input_per_million": 0.20,
+        "cached_input_per_million": 0.05,
+        "output_per_million": 0.50,
+        "note": "Roughly 6x cheaper on tokens than the 4.x tier. No reasoning "
+                "step, which suits a lookup task. Least capable at following "
+                "the JSON format, so expect the odd unparsed batch.",
+    },
+    "grok-4.20-non-reasoning - cheap, 1M context": {
+        "id": "grok-4.20-0309-non-reasoning",
+        "input_per_million": 1.25,
+        "cached_input_per_million": 0.20,
+        "output_per_million": 2.50,
+        "note": "Skips the reasoning step but keeps 4.x-tier comprehension.",
+    },
+    "grok-4.3 - balanced, 1M context": {
+        "id": "grok-4.3",
+        "input_per_million": 1.25,
+        "cached_input_per_million": 0.20,
+        "output_per_million": 2.50,
+        "note": "Reliable middle option. Good if the cheap models miss results.",
+    },
+    "grok-4.5 - pricier flagship": {
+        "id": "grok-4.5",
+        "input_per_million": 2.00,
+        "cached_input_per_million": 0.30,
+        "output_per_million": 6.00,
+        "note": "Best comprehension, ~10x the token cost of grok-4-fast. "
+                "Only worth it if the cheaper models are clearly wrong.",
+    },
+}
+
+DEFAULT_CONTACT_MODEL = "grok-4-fast - cheapest"
+
+# Grok bills DOUBLE on the entire request once it crosses this size, so
+# keeping each request small matters more than batching many into one.
+LONG_CONTEXT_THRESHOLD = 200_000
+LONG_CONTEXT_MULTIPLIER = 2.0
 
 # Contact lookups are the expensive stage, so they are batched: several
 # companies per agentic call rather than one call each.
 # --- Cost model -------------------------------------------------------------
 # Published xAI rates for grok-4.5 as of August 2026. These change, so they're
 # editable in the UI rather than buried here.
-DEFAULT_RATES = {
-    "input_per_million": 2.00,
-    "cached_input_per_million": 0.30,
-    "output_per_million": 6.00,
-    "per_thousand_searches": 5.00,
-}
+DEFAULT_SEARCH_RATE = 5.00   # $ per 1,000 web search tool calls
 
 CONTACT_BATCH_SIZE = 4
 CONTACT_MAX_TOKENS = 600      # replies are compact JSON, so cap them hard
-SCORING_BATCH_SIZE = 15
 
-DEFAULT_SCORING_CRITERIA = """We sell voluntary worksite benefits to employers,
-enrolling their employees on site. A strong lead has enough employees to make an
-on-site enrollment worth the trip, a stable W-2 workforce rather than seasonal or
-contract labor, and a contact senior enough to approve a benefits decision.
 
-Weaker leads: very small headcount, branches that cannot decide locally,
-industries with mostly part-time or transient staff."""
+
 
 
 # ===========================================================================
@@ -544,6 +577,9 @@ CONTACT_SYSTEM_PROMPT = (
     "(4) LinkedIn or business directories. "
     "Use the phone number and address given to confirm you have the right "
     "business, not a same-named company elsewhere. "
+    f"Run at most {CONTACT_MAX_SEARCHES} searches per business. If that hasn't "
+    "settled it, answer U and move on - do not keep searching. "
+    "Keep your reasoning brief; this is a lookup, not an analysis. "
     "Never guess a name from the company name. Never invent a person. "
     "Reply with a JSON array only - no prose, no markdown fences. "
     'Each element: {"i":<id>,"s":"<V|C|U|M>","n":"<First Last or empty>",'
@@ -600,9 +636,12 @@ def extract_usage(payload: dict) -> dict:
     Pull token and tool counts out of a response.
 
     Field names differ between endpoints and have changed over time, so we
-    check the plausible shapes rather than assuming one. Anything missing
-    comes back as zero, which understates rather than overstates the bill -
-    so treat the total as a floor, not a guarantee.
+    check every plausible shape. Reasoning tokens are counted separately
+    where reported, because they bill at the output rate and are usually the
+    reason an agentic call costs more than expected.
+
+    Anything missing comes back as zero, which understates rather than
+    overstates - so treat the total as a floor, not a guarantee.
     """
     usage = payload.get("usage") or {}
 
@@ -613,39 +652,80 @@ def extract_usage(payload: dict) -> dict:
                 return int(value)
         return 0
 
-    cached = first_of("cached_input_tokens", "cache_read_input_tokens")
+    cached = first_of("cached_input_tokens", "cache_read_input_tokens",
+                      "prompt_cached_tokens")
     total_input = first_of("input_tokens", "prompt_tokens")
+    output = first_of("output_tokens", "completion_tokens")
 
-    # Count server-side tool calls wherever they're reported.
-    searches = 0
-    for container in (payload.get("server_side_tool_usage"), usage.get("server_side_tool_usage")):
+    # Reasoning tokens may be nested in a details object or reported flat.
+    reasoning = 0
+    for container_key in ("completion_tokens_details", "output_tokens_details"):
+        container = usage.get(container_key)
         if isinstance(container, dict):
-            for key, value in container.items():
-                if "search" in key.lower() and isinstance(value, (int, float)):
-                    searches += int(value)
+            value = container.get("reasoning_tokens")
+            if isinstance(value, (int, float)):
+                reasoning = int(value)
+                break
+    if not reasoning:
+        reasoning = first_of("reasoning_tokens")
+
+    # Tool calls appear under several shapes; count anything search-like.
+    searches = 0
+    for container in (
+        payload.get("server_side_tool_usage"),
+        usage.get("server_side_tool_usage"),
+        usage.get("tool_usage"),
+        payload.get("tool_usage"),
+    ):
+        if not isinstance(container, dict):
+            continue
+        for key, value in container.items():
+            if "search" not in key.lower():
+                continue
+            if isinstance(value, (int, float)):
+                searches += int(value)
+            elif isinstance(value, dict):
+                # e.g. {"count": 3, "unit": "call"}
+                count = value.get("count") or value.get("calls") or 0
+                if isinstance(count, (int, float)):
+                    searches += int(count)
     if not searches:
-        searches = first_of("num_sources_used", "web_search_calls")
+        searches = first_of("num_sources_used", "web_search_calls", "num_searches")
 
     return {
         "input_tokens": max(total_input - cached, 0),
         "cached_tokens": cached,
-        "output_tokens": first_of("output_tokens", "completion_tokens"),
+        "output_tokens": output,
+        "reasoning_tokens": reasoning,   # already inside output_tokens
         "searches": searches,
         "searches_reported": bool(searches),
+        "total_tokens": total_input + output,
     }
 
 
 def usage_cost(usage: dict, rates: dict) -> float:
-    """Dollar cost of one call's usage at the given rates."""
-    return (
+    """
+    Dollar cost of one call.
+
+    Applies the long-context multiplier when the request crossed the
+    threshold, since Grok re-rates the whole request rather than just the
+    tokens above the line.
+    """
+    multiplier = (
+        LONG_CONTEXT_MULTIPLIER
+        if usage.get("total_tokens", 0) >= LONG_CONTEXT_THRESHOLD else 1.0
+    )
+
+    token_cost = (
         usage["input_tokens"] / 1_000_000 * rates["input_per_million"]
         + usage["cached_tokens"] / 1_000_000 * rates["cached_input_per_million"]
         + usage["output_tokens"] / 1_000_000 * rates["output_per_million"]
-        + usage["searches"] / 1_000 * rates["per_thousand_searches"]
-    )
+    ) * multiplier
+
+    return token_cost + usage["searches"] / 1_000 * rates["per_thousand_searches"]
 
 
-def call_grok_search(prompt: str, api_key: str):
+def call_grok_search(prompt: str, api_key: str, model_id: str = "grok-4-fast-non-reasoning"):
     """
     One agentic call with web search enabled.
 
@@ -654,20 +734,41 @@ def call_grok_search(prompt: str, api_key: str):
 
     Returns (text, usage) so the caller can price the run.
     """
+    body = {
+        "model": model_id,
+        "input": [
+            {"role": "system", "content": CONTACT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "tools": [{"type": "web_search"}],
+        "max_output_tokens": CONTACT_MAX_TOKENS,
+    }
+
+    # Reasoning tokens bill at the output rate, so keep effort low where the
+    # model has a reasoning step at all. Non-reasoning models reject the
+    # parameter outright.
+    if "non-reasoning" not in model_id and "fast" not in model_id:
+        body["reasoning_effort"] = CONTACT_REASONING_EFFORT
+
     response = requests.post(
         XAI_RESPONSES_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": XAI_MODEL,
-            "input": [
-                {"role": "system", "content": CONTACT_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            "tools": [{"type": "web_search"}],
-            "max_output_tokens": CONTACT_MAX_TOKENS,
-        },
+        json=body,
         timeout=240,
     )
+
+    # Older API versions reject reasoning_effort; retry once without it
+    # rather than failing the run.
+    if response.status_code == 400 and "reasoning_effort" in body:
+        body.pop("reasoning_effort")
+        response = requests.post(
+            XAI_RESPONSES_URL,
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            json=body,
+            timeout=240,
+        )
+
     response.raise_for_status()
     payload = response.json()
 
@@ -779,7 +880,8 @@ def apply_contact_result(row, result: dict) -> dict:
     return contact
 
 
-def resolve_contacts(df: pd.DataFrame, api_key: str, limit: int, rates: dict, progress=None):
+def resolve_contacts(df: pd.DataFrame, api_key: str, limit: int, rates: dict,
+                     model_id: str = "grok-4-fast-non-reasoning", progress=None):
     """
     Resolve decision makers for the first `limit` rows, cheapest path first.
 
@@ -791,7 +893,8 @@ def resolve_contacts(df: pd.DataFrame, api_key: str, limit: int, rates: dict, pr
     diagnostics = {
         "calls": 0, "cached": 0, "checked": 0, "errors": [],
         "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0,
-        "searches": 0, "searches_reported": True, "cost": 0.0,
+        "reasoning_tokens": 0, "searches": 0, "searches_reported": True,
+        "cost": 0.0, "long_context_calls": 0, "peak_tokens": 0,
     }
 
     cache = st.session_state.setdefault("grok_contact_cache", {})
@@ -818,13 +921,21 @@ def resolve_contacts(df: pd.DataFrame, api_key: str, limit: int, rates: dict, pr
         )
 
         try:
-            reply, usage = call_grok_search(prompt, api_key)
+            reply, usage = call_grok_search(prompt, api_key, model_id)
             parsed = parse_contact_reply(reply)
             diagnostics["calls"] += 1
 
             # Track spend as we go, so a cancelled run still reports its cost.
-            for field in ("input_tokens", "cached_tokens", "output_tokens", "searches"):
+            for field in ("input_tokens", "cached_tokens", "output_tokens",
+                          "reasoning_tokens", "searches"):
                 diagnostics[field] += usage[field]
+
+            # Flag calls that hit the double-rate tier - that's the signal to
+            # cut batch size further.
+            diagnostics["peak_tokens"] = max(diagnostics["peak_tokens"],
+                                             usage.get("total_tokens", 0))
+            if usage.get("total_tokens", 0) >= LONG_CONTEXT_THRESHOLD:
+                diagnostics["long_context_calls"] += 1
             if not usage["searches_reported"]:
                 diagnostics["searches_reported"] = False
             diagnostics["cost"] += usage_cost(usage, rates)
@@ -869,85 +980,6 @@ def color_status(df: pd.DataFrame):
     if "Industry Tier" in df.columns:
         styler = styler.apply(shade, palette=TIER_COLORS, subset=["Industry Tier"])
     return styler
-
-
-# ===========================================================================
-# Stage 4 - Scoring (xAI)
-# ===========================================================================
-
-def lead_to_summary(row) -> str:
-    """Condense one lead into the fields that matter for judging fit."""
-    contact = f"{row.get('Current First Name', '')} {row.get('Current Last Name', '')}".strip()
-    title = row.get("Current Title") or row.get("Executive Title") or "no title"
-
-    return (
-        f"{row.get('Company Name', '')} | {row.get(SIZE_COLUMN, 'unknown')} employees | "
-        f"{row.get('Primary SIC Code Description', 'unknown industry')} | "
-        f"contact: {contact or 'unnamed'}, {title} | "
-        f"{row.get('Mailing City', '')}, {row.get('Mailing State', '')}"
-    )
-
-
-def parse_scores(raw: str) -> dict:
-    """Turn the model's JSON reply into {row_id: (score, reason)}."""
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("```")[1]
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:]
-
-    parsed = {}
-    for item in json.loads(cleaned):
-        try:
-            parsed[int(item["id"])] = (int(item["score"]), str(item.get("reason", "")))
-        except (KeyError, ValueError, TypeError):
-            continue
-    return parsed
-
-
-def score_leads(df: pd.DataFrame, api_key: str, criteria: str, progress=None) -> pd.DataFrame:
-    """Score each lead 1-10 for fit, in batches, and append score plus reason."""
-    scores = {index: (None, "") for index in df.index}
-    indexes = list(df.index)
-
-    for start in range(0, len(indexes), SCORING_BATCH_SIZE):
-        chunk = indexes[start:start + SCORING_BATCH_SIZE]
-        lines = [f"{index}: {lead_to_summary(df.loc[index])}" for index in chunk]
-
-        try:
-            response = requests.post(
-                XAI_URL,
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Content-Type": "application/json"},
-                json={
-                    "model": XAI_MODEL,
-                    "temperature": 0,
-                    "messages": [
-                        {"role": "system", "content":
-                            "You score B2B sales leads. Reply with a JSON array only - no "
-                            'prose, no fences. Each element: {"id": <number>, '
-                            '"score": <1-10>, "reason": "<12 words max>"}.'},
-                        {"role": "user", "content":
-                            f"Scoring criteria:\\n{criteria}\\n\\nScore each lead 1 (poor) "
-                            f"to 10 (excellent). Use the id at the start of each line.\\n\\n"
-                            + "\\n".join(lines)},
-                    ],
-                },
-                timeout=120,
-            )
-            response.raise_for_status()
-            scores.update(parse_scores(response.json()["choices"][0]["message"]["content"]))
-        except Exception:
-            pass  # leave this batch unscored; the UI reports the gap
-
-        if progress is not None:
-            progress.progress(min((start + SCORING_BATCH_SIZE) / len(indexes), 1.0))
-
-    scored = pd.DataFrame(
-        [{"Fit Score": scores[i][0], "Score Reason": scores[i][1]} for i in df.index],
-        index=df.index,
-    )
-    return df.join(scored).sort_values("Fit Score", ascending=False, na_position="last")
 
 
 # ===========================================================================
@@ -1152,20 +1184,36 @@ def stage_four_contacts(working_df: pd.DataFrame, file_key: str):
         "when it's stale, and fills one in when the record has none."
     )
 
-    rates = dict(DEFAULT_RATES)
+    model_label = st.selectbox(
+        "Model", list(CONTACT_MODELS.keys()),
+        index=list(CONTACT_MODELS.keys()).index(DEFAULT_CONTACT_MODEL),
+        help="Contact lookup is retrieval, not reasoning, so the cheap models "
+             "usually do it about as well.",
+    )
+    model = CONTACT_MODELS[model_label]
+    st.caption(model["note"])
+
+    rates = {
+        "input_per_million": model["input_per_million"],
+        "cached_input_per_million": model["cached_input_per_million"],
+        "output_per_million": model["output_per_million"],
+        "per_thousand_searches": DEFAULT_SEARCH_RATE,
+    }
+
     with st.expander("API rates (edit if xAI's pricing changes)"):
         r1, r2, r3, r4 = st.columns(4)
         rates["input_per_million"] = r1.number_input(
-            "$ / 1M input", value=DEFAULT_RATES["input_per_million"], step=0.25, format="%.2f")
+            "$ / 1M input", value=rates["input_per_million"], step=0.25, format="%.2f")
         rates["cached_input_per_million"] = r2.number_input(
-            "$ / 1M cached", value=DEFAULT_RATES["cached_input_per_million"], step=0.10, format="%.2f")
+            "$ / 1M cached", value=rates["cached_input_per_million"], step=0.10, format="%.2f")
         rates["output_per_million"] = r3.number_input(
-            "$ / 1M output", value=DEFAULT_RATES["output_per_million"], step=0.25, format="%.2f")
+            "$ / 1M output", value=rates["output_per_million"], step=0.25, format="%.2f")
         rates["per_thousand_searches"] = r4.number_input(
-            "$ / 1k searches", value=DEFAULT_RATES["per_thousand_searches"], step=0.50, format="%.2f")
+            "$ / 1k searches", value=rates["per_thousand_searches"], step=0.50, format="%.2f")
         st.caption(
-            "Defaults are xAI's published grok-4.5 rates as of August 2026. "
-            "Search calls usually dominate the bill, not tokens."
+            f"Requests over {LONG_CONTEXT_THRESHOLD:,} tokens bill at "
+            f"{LONG_CONTEXT_MULTIPLIER:g}x on the whole request, which is why "
+            f"only {CONTACT_BATCH_SIZE} companies go per call."
         )
 
     cached_companies = len(st.session_state.get("grok_contact_cache", {}))
@@ -1183,15 +1231,20 @@ def stage_four_contacts(working_df: pd.DataFrame, file_key: str):
 
     # Rough forecast: ~700 input and ~250 output tokens per call, plus about
     # two searches per company. Deliberately not optimistic.
+    # Each search injects its results into the request, so input tokens scale
+    # with searches, not just with the prompt. Assume ~8k injected per search.
+    searches = limit * CONTACT_MAX_SEARCHES
     estimate = (
-        calls * 700 / 1_000_000 * rates["input_per_million"]
-        + calls * 250 / 1_000_000 * rates["output_per_million"]
-        + limit * 2 / 1_000 * rates["per_thousand_searches"]
+        (calls * 600 + searches * 8_000) / 1_000_000 * rates["input_per_million"]
+        + calls * 400 / 1_000_000 * rates["output_per_million"]
+        + searches / 1_000 * rates["per_thousand_searches"]
     )
+    search_floor = searches / 1_000 * rates["per_thousand_searches"]
     st.caption(
         f"About {calls} call(s) for {limit} companies ({CONTACT_BATCH_SIZE} per call). "
         f"Rough estimate ${estimate:.2f}, roughly ${estimate / max(limit, 1):.3f} per "
-        "company. Companies already checked are free."
+        f"company - of which ${search_floor:.2f} is web search fees, which no "
+        "model change reduces. Companies already checked are free."
     )
 
     cache_key = f"contacts::{file_key}::{len(working_df)}::{limit}"
@@ -1200,7 +1253,7 @@ def stage_four_contacts(working_df: pd.DataFrame, file_key: str):
         progress = st.progress(0.0)
         try:
             st.session_state[cache_key] = resolve_contacts(
-                working_df, XAI_API_KEY, limit, rates, progress
+                working_df, XAI_API_KEY, limit, rates, model["id"], progress
             )
         except Exception as err:
             st.error(f"Contact lookup failed: {err}")
@@ -1247,8 +1300,11 @@ def stage_four_contacts(working_df: pd.DataFrame, file_key: str):
              "Cost": f"${diagnostics['input_tokens'] / 1_000_000 * rates['input_per_million']:.4f}"},
             {"Item": "Cached input tokens", "Count": f"{diagnostics['cached_tokens']:,}",
              "Cost": f"${diagnostics['cached_tokens'] / 1_000_000 * rates['cached_input_per_million']:.4f}"},
-            {"Item": "Output tokens", "Count": f"{diagnostics['output_tokens']:,}",
+            {"Item": "Output tokens (incl. reasoning)",
+             "Count": f"{diagnostics['output_tokens']:,}",
              "Cost": f"${diagnostics['output_tokens'] / 1_000_000 * rates['output_per_million']:.4f}"},
+            {"Item": "  of which reasoning",
+             "Count": f"{diagnostics['reasoning_tokens']:,}", "Cost": "included above"},
             {"Item": "Web searches", "Count": f"{diagnostics['searches']:,}",
              "Cost": f"${search_cost:.4f}"},
         ]), use_container_width=True, hide_index=True)
@@ -1258,6 +1314,20 @@ def stage_four_contacts(working_df: pd.DataFrame, file_key: str):
             f"{diagnostics['calls']} call(s), {diagnostics['checked']} companies checked, "
             f"{diagnostics['cached']} served from cache."
         )
+
+        if diagnostics["long_context_calls"]:
+            st.error(
+                f"{diagnostics['long_context_calls']} call(s) crossed "
+                f"{LONG_CONTEXT_THRESHOLD:,} tokens and billed at "
+                f"{LONG_CONTEXT_MULTIPLIER:g}x. Largest was "
+                f"{diagnostics['peak_tokens']:,} tokens. Lower CONTACT_BATCH_SIZE "
+                "or CONTACT_MAX_SEARCHES to avoid this."
+            )
+        elif diagnostics["peak_tokens"]:
+            st.caption(
+                f"Largest request {diagnostics['peak_tokens']:,} tokens, under "
+                f"the {LONG_CONTEXT_THRESHOLD:,} double-rate threshold."
+            )
 
         if not diagnostics["searches_reported"]:
             st.warning(
@@ -1304,7 +1374,7 @@ def stage_four_contacts(working_df: pd.DataFrame, file_key: str):
     actionable = resolved[resolved["Contact Status"].isin(allowed)].copy()
     set_aside = resolved[~resolved["Contact Status"].isin(allowed)].copy()
 
-    st.caption(f"{len(actionable):,} leads carried into scoring, {len(set_aside):,} set aside.")
+    st.caption(f"{len(actionable):,} leads on the working list, {len(set_aside):,} set aside.")
 
     if not set_aside.empty:
         download_row(set_aside, "Download set-aside leads", f"set_aside_{file_key}")
@@ -1312,62 +1382,14 @@ def stage_four_contacts(working_df: pd.DataFrame, file_key: str):
     return actionable, set_aside
 
 
-def stage_five_score(working_df: pd.DataFrame, file_key: str) -> pd.DataFrame:
-    """Stage 4: score what's left."""
-    st.subheader("5. Score the remaining leads")
-
-    if not XAI_API_KEY:
-        st.info("No xAI key. Add XAI_API_KEY to Secrets to enable scoring.")
-        return working_df
-
-    if not st.toggle("Enable scoring", value=False,
-                     help="Off by default so it can't spend tokens unattended."):
-        return working_df
-
-    criteria = st.text_area("What makes a good lead?",
-                            value=DEFAULT_SCORING_CRITERIA, height=160)
-
-    calls = -(-len(working_df) // SCORING_BATCH_SIZE)
-    st.caption(f"{len(working_df):,} leads, about {calls} API calls.")
-
-    cache_key = f"scored::{file_key}::{len(working_df)}"
-
-    if st.button(f"Score {len(working_df):,} leads", type="primary"):
-        progress = st.progress(0.0)
-        try:
-            st.session_state[cache_key] = score_leads(
-                working_df, XAI_API_KEY, criteria, progress
-            )
-        except Exception as err:
-            st.error(f"Scoring failed: {err}")
-            return working_df
-        finally:
-            progress.empty()
-
-    if cache_key not in st.session_state:
-        return working_df
-
-    scored = st.session_state[cache_key]
-    unscored = int(scored["Fit Score"].isna().sum())
-    if unscored:
-        st.warning(f"{unscored:,} leads came back unscored. Run again to retry.")
-
-    floor = st.slider("Minimum fit score", 1, 10, 1)
-    if floor > 1:
-        scored = scored[scored["Fit Score"].fillna(0) >= floor].copy()
-        st.caption(f"{len(scored):,} leads at {floor} or above.")
-
-    return scored
-
-
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
 
     st.title(APP_TITLE)
     st.write(
-        "Five stages, in order: filter by size, verify the address is a mailable "
-        "commercial location, keep the industries worth working, confirm or "
-        "correct the decision maker, then score what's left."
+        "Four stages, in order: filter by size, verify the address is a mailable "
+        "commercial location, prioritise the industries worth working, then "
+        "confirm or correct the decision maker."
     )
 
     uploaded_file = st.file_uploader("Upload a lead list", type=["csv"])
@@ -1411,8 +1433,6 @@ def main() -> None:
     st.divider()
     working_df, set_aside = stage_four_contacts(working_df, uploaded_file.name)
 
-    st.divider()
-    working_df = stage_five_score(working_df, uploaded_file.name)
 
     # --- Final list ---
     st.divider()
