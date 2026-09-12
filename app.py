@@ -2065,14 +2065,31 @@ def build_handoff(df: pd.DataFrame) -> pd.DataFrame:
     return handoff
 
 
-def handoff_to_excel(handoff: pd.DataFrame) -> bytes:
-    """Write the handoff sheet to XLSX bytes for the download button."""
+def handoff_to_file(handoff: pd.DataFrame):
+    """
+    Serialize the handoff sheet for download.
+
+    Prefers XLSX, but falls back to CSV when openpyxl isn't installed -
+    ChatGPT reads either, so a missing package shouldn't block the handoff.
+    Returns (bytes, filename, mime).
+    """
     from io import BytesIO
 
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        handoff.to_excel(writer, index=False, sheet_name="Research")
-    return buffer.getvalue()
+    try:
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            handoff.to_excel(writer, index=False, sheet_name="Research")
+        return (
+            buffer.getvalue(),
+            HANDOFF_FILENAME,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except ImportError:
+        return (
+            handoff.to_csv(index=False).encode("utf-8"),
+            HANDOFF_FILENAME.replace(".xlsx", ".csv"),
+            "text/csv",
+        )
 
 
 CHATGPT_PROMPT = """I am uploading a file named CHATGPT_RESEARCH_HANDOFF.xlsx.
@@ -3018,13 +3035,21 @@ def stage_handoff(working_df: pd.DataFrame, file_key: str) -> pd.DataFrame:
     left, right = st.columns([1, 1])
 
     with left:
+        payload, filename, mime = handoff_to_file(handoff)
+
         st.download_button(
-            f"Download {HANDOFF_FILENAME} ({len(handoff):,} companies)",
-            data=handoff_to_excel(handoff),
-            file_name=HANDOFF_FILENAME,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            f"Download {filename} ({len(handoff):,} companies)",
+            data=payload,
+            file_name=filename,
+            mime=mime,
             type="primary",
         )
+
+        if filename.endswith(".csv"):
+            st.info(
+                "Exported as CSV because openpyxl isn't installed. ChatGPT reads "
+                "CSV fine. Add openpyxl to requirements.txt for XLSX."
+            )
         st.caption(
             "Upload this to ChatGPT with the prompt beside it. Work in batches "
             "of about 25 - a long list tends to come back truncated or with "
@@ -3034,13 +3059,17 @@ def stage_handoff(working_df: pd.DataFrame, file_key: str) -> pd.DataFrame:
     with right:
         st.caption("Copy this prompt into ChatGPT with the file attached.")
 
-    st.code(CHATGPT_PROMPT, language=None)
+    st.code(
+        CHATGPT_PROMPT.replace(HANDOFF_FILENAME, filename)
+        if filename != HANDOFF_FILENAME else CHATGPT_PROMPT,
+        language=None,
+    )
 
     st.divider()
     st.write("**When the research comes back**")
 
     returned_file = st.file_uploader(
-        "Upload the researched XLSX", type=["xlsx"], key=f"research_{file_key}"
+        "Upload the researched file", type=["xlsx", "csv"], key=f"research_{file_key}"
     )
 
     if returned_file is None:
@@ -3051,7 +3080,16 @@ def stage_handoff(working_df: pd.DataFrame, file_key: str) -> pd.DataFrame:
         return working_df
 
     try:
-        returned = pd.read_excel(returned_file, dtype=str)
+        if returned_file.name.lower().endswith(".csv"):
+            returned = pd.read_csv(returned_file, dtype=str)
+        else:
+            returned = pd.read_excel(returned_file, dtype=str)
+    except ImportError:
+        st.error(
+            "Reading XLSX needs openpyxl, which isn't installed. Add it to "
+            "requirements.txt, or ask ChatGPT to return a CSV instead."
+        )
+        return working_df
     except Exception as err:
         st.error(f"Couldn't read that file: {err}")
         return working_df
